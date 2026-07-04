@@ -1,0 +1,7 @@
+teto.db
+.env
+__pycache__/
+*.pyc
+*.pyo
+.vscode/
+.idea/
