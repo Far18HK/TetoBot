@@ -48,7 +48,11 @@ def is_staff_app():
 # ─────────────────────────────────────────
 # DB
 # ─────────────────────────────────────────
-db = sqlite3.connect("teto.db", check_same_thread=False)
+# En Railway, monta un Volume (ej. en /data) y define la variable de entorno
+# DB_PATH=/data/teto.db para que la base de datos persista entre deploys.
+# Si no se define, cae de vuelta a "teto.db" en el directorio del proyecto (uso local).
+DB_PATH = os.getenv("DB_PATH", "teto.db")
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = db.cursor()
 cursor.execute("""CREATE TABLE IF NOT EXISTS economia (
     guild_id INTEGER, user_id INTEGER, balance INTEGER DEFAULT 0, banco INTEGER DEFAULT 0,
@@ -393,7 +397,7 @@ class TiendaLayoutView(discord.ui.LayoutView):
         ))
         container.add_item(discord.ui.Separator())
         for idx, (_id, nombre, precio, descripcion, emoji, usable, imagen) in enumerate(items):
-            etiqueta = "\n*Usable con `!useitem`*" if usable else ""
+            etiqueta = "\n*Usable con `/useitem`*" if usable else ""
             texto = f"**{emoji} {nombre}**\n{descripcion or chr(0x200b)}{etiqueta}"
             if imagen and imagen.strip().lower().startswith(("http://", "https://")):
                 section = discord.ui.Section(
@@ -837,25 +841,34 @@ class EconomiaCog(commands.Cog):
         embed.description = "\n".join(lineas)
         await ctx.send(embed=embed)
 
-    @commands.command(name="useitem", aliases=["usaritem", "useit"])
-    async def useitem_cmd(self, ctx: commands.Context, *, nombre: str = None):
-        if not nombre:
-            return await send_msg(ctx, "Uso: `!useitem <nombre del item>`", title="🎒 Usar item")
-        inventario = get_inventario(ctx.guild.id, ctx.author.id)
+    @app_commands.command(name="useitem", description="Usa un item de tu inventario")
+    @app_commands.describe(nombre="El item que quieres usar")
+    async def useitem_slash(self, interaction: discord.Interaction, nombre: str):
+        guild_id = interaction.guild.id
+        inventario = get_inventario(guild_id, interaction.user.id)
         encontrado = next((it for it in inventario if it[0].lower() == nombre.lower()), None)
         if not encontrado:
-            return await send_msg(ctx, f"No tienes el item `{nombre}` we", title="🎒 Usar item", color=0xE74C3C)
+            return await interaction.response.send_message(f"No tienes el item `{nombre}` we", ephemeral=True)
         item_nombre, _cantidad = encontrado
-        info = get_item_tienda(ctx.guild.id, item_nombre)
+        info = get_item_tienda(guild_id, item_nombre)
         emoji = info[4] if info else "📦"
         usable = info[5] if info else 0
         mensaje_uso = info[6] if info else ""
         if not usable:
-            return await send_msg(ctx, f"**{item_nombre}** no se puede usar we, es solo de colección", title="🎒 Usar item", color=0xE74C3C)
-        add_item(ctx.guild.id, ctx.author.id, item_nombre, -1)
+            return await interaction.response.send_message(f"**{item_nombre}** no se puede usar we, es solo de colección", ephemeral=True)
+        add_item(guild_id, interaction.user.id, item_nombre, -1)
         texto = mensaje_uso or f"Usaste **{item_nombre}**."
-        texto = texto.replace("{user}", ctx.author.mention).replace("{item}", item_nombre)
-        await ctx.send(embed=discord.Embed(title=f"{emoji} Item usado", description=texto, color=0x9B59B6))
+        texto = texto.replace("{user}", interaction.user.mention).replace("{item}", item_nombre)
+        await interaction.response.send_message(embed=discord.Embed(title=f"{emoji} Item usado", description=texto, color=0x9B59B6))
+
+    @useitem_slash.autocomplete("nombre")
+    async def useitem_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not interaction.guild:
+            return []
+        inventario = get_inventario(interaction.guild.id, interaction.user.id)
+        current = current.lower()
+        return [app_commands.Choice(name=f"{nombre} x{cantidad}", value=nombre)
+                for nombre, cantidad in inventario if current in nombre.lower()][:25]
 
 async def autocomplete_items_tienda(interaction: discord.Interaction, current: str):
     if not interaction.guild:
@@ -1471,7 +1484,7 @@ class HelpCog(commands.Cog):
             "`!tienda` — Ve los items disponibles con botones para comprar al toque\n"
             "`!comprar <item>` — Compra un item (alternativa por texto)\n"
             "`!inventario` — Ve tu inventario\n"
-            "`!useitem <item>` — Usa un item de tu inventario"
+            "`/useitem <item>` — Usa un item de tu inventario"
         ), inline=False)
         embed.add_field(name="🎰 Casino", value=(
             "`/slots <apuesta>` — Tragamonedas\n"
