@@ -18,7 +18,7 @@ log = logging.getLogger("Teto")
 
 TOKEN = os.getenv("TOKEN")
 TU_ID = 1180967503682355220
-ROLES_COMANDOS = ["Admin", "Moderador", "Shogun 🦈", "ViceRoot", "Root", "Daimyō", "Rōnin"]
+ROLES_COMANDOS = ["Shogun 🦈", "Root", "ViceRoot"]
 
 if not TOKEN:
     raise RuntimeError("❌ Falta TOKEN")
