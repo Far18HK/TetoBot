@@ -191,7 +191,8 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS config (
     slut_win_min INTEGER DEFAULT 100,
     slut_win_max INTEGER DEFAULT 400,
     slut_loss_min INTEGER DEFAULT 50,
-    slut_loss_max INTEGER DEFAULT 250
+    slut_loss_max INTEGER DEFAULT 250,
+    usar_respuestas_default INTEGER DEFAULT 1
 )""")
 cursor.execute("""CREATE TABLE IF NOT EXISTS dashboard_staff (
     id SERIAL PRIMARY KEY, guild_id BIGINT, tipo TEXT, discord_id BIGINT,
@@ -203,6 +204,7 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS mensajes_custom (
 # Migraciones para bases de datos ya existentes (por si les faltan columnas nuevas)
 _MIGRACIONES = [
     ("economia", "banco", "INTEGER DEFAULT 0"),
+    ("config", "usar_respuestas_default", "INTEGER DEFAULT 1"),
     ("tienda", "usable", "INTEGER DEFAULT 0"),
     ("tienda", "mensaje_uso", "TEXT DEFAULT ''"),
     ("tienda", "imagen", "TEXT DEFAULT ''"),
@@ -859,45 +861,68 @@ def revalidar_participantes(guild_id: int, participantes: dict) -> dict:
 # COG ECONOMÍA
 # ─────────────────────────────────────────
 TRABAJOS = [
-    "repartiste pizza toda la noche",
-    "le hiciste la tarea a un cabro de colegio",
-    "vendiste completos en la esquina",
-    "hiciste de streamer 2 horas",
-    "ayudaste a mudar un piano",
-    "cuidaste perros del vecino",
+    "repartiste pizza toda la noche y ganaste **{amount}**",
+    "le hiciste la tarea a un cabro de colegio y te pagó **{amount}**",
+    "vendiste completos en la esquina y sacaste **{amount}**",
+    "hiciste de streamer 2 horas y te donaron **{amount}**",
+    "ayudaste a mudar un piano y te dieron **{amount}**",
+    "cuidaste perros del vecino y ganaste **{amount}**",
 ]
 
-CRIMENES = [
-    "intentaste clonar una tarjeta",
-    "le robaste el WiFi al vecino",
-    "vendiste copias piratas",
-    "asaltaste un kiosko",
-    "hackeaste una cuenta de Netflix",
+CRIME_EXITOS = [
+    "intentaste clonar una tarjeta y te saliste con la tuya. Ganaste **{amount}**",
+    "le robaste el WiFi al vecino y de paso le sacaste **{amount}**",
+    "vendiste copias piratas y ganaste **{amount}**",
+    "asaltaste un kiosko y te llevaste **{amount}**",
+    "hackeaste una cuenta de Netflix y la revendiste por **{amount}**",
+]
+
+CRIME_FALLOS = [
+    "intentaste clonar una tarjeta pero te pillaron. Perdiste **{amount}**",
+    "le robaste el WiFi al vecino pero te cachó y tuviste que pagarle **{amount}**",
+    "vendiste copias piratas pero te multaron **{amount}**",
+    "asaltaste un kiosko pero te agarró carabineros. Perdiste **{amount}**",
+    "hackeaste una cuenta de Netflix pero te rastrearon. Multa de **{amount}**",
 ]
 
 SLUT_EXITOS = [
-    "coqueteaste con alguien en un bar y te invitó unos tragos, terminaste sacándole plata",
-    "vendiste fotos subidas de tono por Internet",
-    "hiciste de acompañante pagado en una fiesta",
-    "le tiraste los perros a alguien con plata y te terminó regalando algo",
-    "trabajaste una noche en un club nocturno",
-    "conseguiste un sugar daddy/mommy por una noche",
+    "coqueteaste con alguien en un bar y te invitó unos tragos, terminaste sacándole **{amount}**",
+    "vendiste fotos subidas de tono por Internet y ganaste **{amount}**",
+    "hiciste de acompañante pagado en una fiesta y te pagaron **{amount}**",
+    "le tiraste los perros a alguien con plata y te regaló **{amount}**",
+    "trabajaste una noche en un club nocturno y ganaste **{amount}**",
+    "conseguiste un sugar daddy/mommy por una noche que te dio **{amount}**",
 ]
 
 SLUT_FALLOS = [
-    "te intentaste ligar a alguien pero resultó ser policía encubierto",
-    "te estafaron prometiéndote plata a cambio de nada",
-    "te agarraron in fraganti y tuviste que pagar para que no dijeran nada",
-    "la persona que ligaste resultó no tener ni un peso",
-    "te cacharon tus papás we, que vergüenza",
+    "te intentaste ligar a alguien pero resultó ser policía encubierto. Perdiste **{amount}**",
+    "te estafaron prometiéndote plata a cambio de nada. Perdiste **{amount}**",
+    "te agarraron in fraganti y tuviste que pagar **{amount}** para que no dijeran nada",
+    "la persona que ligaste resultó no tener ni un peso y encima te cobró **{amount}** de propina",
+    "te cacharon tus papás we, que vergüenza — te descontaron **{amount}** de multa",
 ]
 
-# tipos válidos: "trabajo", "crime", "slut_exito", "slut_fallo"
+# tipos válidos: "trabajo", "crime_exito", "crime_fallo", "slut_exito", "slut_fallo"
 def get_mensajes_extra(guild_id: int, tipo: str) -> list:
     """Frases personalizadas que el dueño agregó desde el Dashboard, para sumarlas
-    a las frases por defecto de cada acción (!trabajo, !crime, !slut)."""
+    (o reemplazar, según el toggle) a las frases por defecto de cada acción."""
     cursor.execute("SELECT texto FROM mensajes_custom WHERE guild_id=%s AND tipo=%s", (guild_id, tipo))
     return [fila[0] for fila in cursor.fetchall()]
+
+def elegir_frase(guild_id: int, tipo: str, defaults: list, monto: int) -> str:
+    """Elige una frase (de las por defecto y/o las personalizadas, según el toggle
+    'usar_respuestas_default' del Dashboard) y le mete el monto donde diga {amount}."""
+    cfg = get_config(guild_id)
+    custom = get_mensajes_extra(guild_id, tipo)
+    if cfg.get("usar_respuestas_default", 1):
+        pool = defaults + custom
+    else:
+        pool = custom or defaults  # si no hay ninguna personalizada, no lo dejamos sin frase
+    plantilla = random.choice(pool)
+    monto_str = format_dinero(guild_id, monto)
+    if "{amount}" in plantilla:
+        return plantilla.replace("{amount}", monto_str)
+    return f"{plantilla} — **{monto_str}**"
 
 class EconomiaCog(commands.Cog):
     def __init__(self, bot):
@@ -923,11 +948,11 @@ class EconomiaCog(commands.Cog):
         restante = tiempo_restante(get_cooldown(ctx.guild.id, ctx.author.id, "last_trabajo"), cfg["cooldown_trabajo"])
         if restante:
             return await send_msg(ctx, f"⏳ Ya trabajaste we, vuelve en **{formatear_tiempo(restante)}**", title="💼 Trabajo")
-        frase = random.choice(TRABAJOS + get_mensajes_extra(ctx.guild.id, "trabajo"))
         ganancia = random.randint(cfg["trabajo_min"], cfg["trabajo_max"])
         modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
         set_cooldown(ctx.guild.id, ctx.author.id, "last_trabajo")
-        await send_msg(ctx, f"{ctx.author.mention} {frase} y ganaste **{format_dinero(ctx.guild.id, ganancia)}**", title="💼 Trabajo")
+        texto = elegir_frase(ctx.guild.id, "trabajo", TRABAJOS, ganancia)
+        await send_msg(ctx, f"{ctx.author.mention} {texto}", title="💼 Trabajo")
 
     @commands.command(name="crime")
     async def crime(self, ctx: commands.Context):
@@ -936,15 +961,16 @@ class EconomiaCog(commands.Cog):
         if restante:
             return await send_msg(ctx, f"⏳ Todavía te andan buscando we, espera **{formatear_tiempo(restante)}**", title="🕶️ Crime")
         set_cooldown(ctx.guild.id, ctx.author.id, "last_crime")
-        frase = random.choice(CRIMENES + get_mensajes_extra(ctx.guild.id, "crime"))
         if random.random() < cfg["crime_chance"]:
             ganancia = random.randint(cfg["crime_win_min"], cfg["crime_win_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
-            await send_msg(ctx, f"{ctx.author.mention} {frase} y te saliste con la tuya. Ganaste **{format_dinero(ctx.guild.id, ganancia)}**", title="🕶️ Crime")
+            texto = elegir_frase(ctx.guild.id, "crime_exito", CRIME_EXITOS, ganancia)
+            await send_msg(ctx, f"{ctx.author.mention} {texto}", title="🕶️ Crime")
         else:
             perdida = random.randint(cfg["crime_loss_min"], cfg["crime_loss_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, -perdida)
-            await send_msg(ctx, f"🚓 {ctx.author.mention} {frase} pero te pillaron. Perdiste **{format_dinero(ctx.guild.id, perdida)}**", title="🕶️ Crime", color=0xE74C3C)
+            texto = elegir_frase(ctx.guild.id, "crime_fallo", CRIME_FALLOS, perdida)
+            await send_msg(ctx, f"🚓 {ctx.author.mention} {texto}", title="🕶️ Crime", color=0xE74C3C)
 
     @commands.command(name="slut")
     async def slut(self, ctx: commands.Context):
@@ -954,15 +980,15 @@ class EconomiaCog(commands.Cog):
             return await send_msg(ctx, f"⏳ Espera **{formatear_tiempo(restante)}** para volver a hacerlo we", title="💋 Slut")
         set_cooldown_generic(ctx.guild.id, ctx.author.id, "slut")
         if random.random() < cfg["slut_chance"]:
-            frase = random.choice(SLUT_EXITOS + get_mensajes_extra(ctx.guild.id, "slut_exito"))
             ganancia = random.randint(cfg["slut_win_min"], cfg["slut_win_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
-            await send_msg(ctx, f"{ctx.author.mention} {frase} y ganaste **{format_dinero(ctx.guild.id, ganancia)}**", title="💋 Slut")
+            texto = elegir_frase(ctx.guild.id, "slut_exito", SLUT_EXITOS, ganancia)
+            await send_msg(ctx, f"{ctx.author.mention} {texto}", title="💋 Slut")
         else:
-            frase = random.choice(SLUT_FALLOS + get_mensajes_extra(ctx.guild.id, "slut_fallo"))
             perdida = random.randint(cfg["slut_loss_min"], cfg["slut_loss_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, -perdida)
-            await send_msg(ctx, f"{ctx.author.mention} {frase}. Perdiste **{format_dinero(ctx.guild.id, perdida)}**", title="💋 Slut", color=0xE74C3C)
+            texto = elegir_frase(ctx.guild.id, "slut_fallo", SLUT_FALLOS, perdida)
+            await send_msg(ctx, f"{ctx.author.mention} {texto}", title="💋 Slut", color=0xE74C3C)
 
     @commands.command(name="robar", aliases=["rob"])
     async def robar(self, ctx: commands.Context, victima: discord.Member = None):
