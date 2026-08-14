@@ -197,6 +197,9 @@ cursor.execute("""CREATE TABLE IF NOT EXISTS dashboard_staff (
     id SERIAL PRIMARY KEY, guild_id BIGINT, tipo TEXT, discord_id BIGINT,
     puede_tienda INTEGER DEFAULT 1, puede_economia INTEGER DEFAULT 0
 )""")
+cursor.execute("""CREATE TABLE IF NOT EXISTS mensajes_custom (
+    id SERIAL PRIMARY KEY, guild_id BIGINT, tipo TEXT, texto TEXT
+)""")
 # Migraciones para bases de datos ya existentes (por si les faltan columnas nuevas)
 _MIGRACIONES = [
     ("economia", "banco", "INTEGER DEFAULT 0"),
@@ -889,6 +892,13 @@ SLUT_FALLOS = [
     "te cacharon tus papás we, que vergüenza",
 ]
 
+# tipos válidos: "trabajo", "crime", "slut_exito", "slut_fallo"
+def get_mensajes_extra(guild_id: int, tipo: str) -> list:
+    """Frases personalizadas que el dueño agregó desde el Dashboard, para sumarlas
+    a las frases por defecto de cada acción (!trabajo, !crime, !slut)."""
+    cursor.execute("SELECT texto FROM mensajes_custom WHERE guild_id=%s AND tipo=%s", (guild_id, tipo))
+    return [fila[0] for fila in cursor.fetchall()]
+
 class EconomiaCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -913,7 +923,7 @@ class EconomiaCog(commands.Cog):
         restante = tiempo_restante(get_cooldown(ctx.guild.id, ctx.author.id, "last_trabajo"), cfg["cooldown_trabajo"])
         if restante:
             return await send_msg(ctx, f"⏳ Ya trabajaste we, vuelve en **{formatear_tiempo(restante)}**", title="💼 Trabajo")
-        frase = random.choice(TRABAJOS)
+        frase = random.choice(TRABAJOS + get_mensajes_extra(ctx.guild.id, "trabajo"))
         ganancia = random.randint(cfg["trabajo_min"], cfg["trabajo_max"])
         modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
         set_cooldown(ctx.guild.id, ctx.author.id, "last_trabajo")
@@ -926,7 +936,7 @@ class EconomiaCog(commands.Cog):
         if restante:
             return await send_msg(ctx, f"⏳ Todavía te andan buscando we, espera **{formatear_tiempo(restante)}**", title="🕶️ Crime")
         set_cooldown(ctx.guild.id, ctx.author.id, "last_crime")
-        frase = random.choice(CRIMENES)
+        frase = random.choice(CRIMENES + get_mensajes_extra(ctx.guild.id, "crime"))
         if random.random() < cfg["crime_chance"]:
             ganancia = random.randint(cfg["crime_win_min"], cfg["crime_win_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
@@ -944,12 +954,12 @@ class EconomiaCog(commands.Cog):
             return await send_msg(ctx, f"⏳ Espera **{formatear_tiempo(restante)}** para volver a hacerlo we", title="💋 Slut")
         set_cooldown_generic(ctx.guild.id, ctx.author.id, "slut")
         if random.random() < cfg["slut_chance"]:
-            frase = random.choice(SLUT_EXITOS)
+            frase = random.choice(SLUT_EXITOS + get_mensajes_extra(ctx.guild.id, "slut_exito"))
             ganancia = random.randint(cfg["slut_win_min"], cfg["slut_win_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, ganancia)
             await send_msg(ctx, f"{ctx.author.mention} {frase} y ganaste **{format_dinero(ctx.guild.id, ganancia)}**", title="💋 Slut")
         else:
-            frase = random.choice(SLUT_FALLOS)
+            frase = random.choice(SLUT_FALLOS + get_mensajes_extra(ctx.guild.id, "slut_fallo"))
             perdida = random.randint(cfg["slut_loss_min"], cfg["slut_loss_max"])
             modificar_balance(ctx.guild.id, ctx.author.id, -perdida)
             await send_msg(ctx, f"{ctx.author.mention} {frase}. Perdiste **{format_dinero(ctx.guild.id, perdida)}**", title="💋 Slut", color=0xE74C3C)
