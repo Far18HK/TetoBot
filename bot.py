@@ -451,7 +451,7 @@ def parse_emoji_boton(emoji_str: str):
     except Exception:
         return None
 
-MAX_ITEMS_TIENDA = 10  # Discord permite máximo 10 embeds por mensaje
+MAX_COMPONENTES_TIENDA = 40  # límite duro de Discord para Components V2 en un solo mensaje
 
 class ComprarButton(discord.ui.Button):
     def __init__(self, nombre: str, precio: int, guild_id: int):
@@ -502,21 +502,42 @@ class CategoriaSelect(discord.ui.Select):
 
 class TiendaLayoutView(discord.ui.LayoutView):
     """Tienda armada con Components V2: selector de categoría arriba, y cada item como
-    una fila con miniatura + texto + botón de compra, todo en un único mensaje (sin embeds)."""
+    una fila con miniatura + texto + botón de compra, todo en un único mensaje (sin embeds).
+
+    Discord permite máximo 40 componentes en total por mensaje (contando todo lo anidado:
+    separadores, secciones, texto, botones, etc). Cada item gasta una cantidad distinta de
+    componentes según tenga imagen o no, así que en vez de un límite fijo de "items" vamos
+    sumando el costo real y paramos justo antes de pasarnos, para nunca crashear sin
+    importar cuántos items tenga la tienda o cuántos tengan imagen."""
+
+    @staticmethod
+    def _costo_bloque(tipo: str, data) -> int:
+        if tipo == "header":
+            return 2  # Separator(1) + TextDisplay(1)
+        _id, nombre, precio, descripcion, usable, imagen, rol_id, dinero_efecto, es_seguro, categoria = data
+        tiene_imagen = bool(imagen) and imagen.strip().lower().startswith(("http://", "https://"))
+        if tiene_imagen:
+            return 6  # Separator(1) + Section(1) + TextDisplay(1) + Thumbnail(1) + ActionRow(1) + Button(1)
+        return 4  # Separator(1) + Section(1) + TextDisplay(1) + Button-accessory(1)
+
     def __init__(self, guild_id: int, items, categoria_actual: str = None):
         super().__init__(timeout=180)
         total = len(items)
-        items = items[:MAX_ITEMS_TIENDA]
         categorias = get_categorias(guild_id)
         container = discord.ui.Container(accent_color=0x2ECC71)
         container.add_item(discord.ui.TextDisplay(
             "**🛒 Tienda**\nPulsa un botón para comprar el item al instante, o usa el comando `!comprar <item>`.\n"
             "Usa `!inventario` para ver lo que ya compraste."
         ))
+        presupuesto = MAX_COMPONENTES_TIENDA - 1  # -1 por el Container mismo
+        presupuesto -= 1  # el TextDisplay de intro
         if categorias:
             fila_categoria = discord.ui.ActionRow()
             fila_categoria.add_item(CategoriaSelect(guild_id, categorias, categoria_actual))
             container.add_item(fila_categoria)
+            presupuesto -= 2  # ActionRow(1) + Select(1)
+        presupuesto -= 2  # reservado por si hace falta el aviso de "mostrando X de Y" al final
+        presupuesto -= 2  # margen de seguridad extra, por si acaso
 
         if not items:
             container.add_item(discord.ui.Separator())
@@ -533,7 +554,13 @@ class TiendaLayoutView(discord.ui.LayoutView):
                     categoria_mostrada = categoria_item
                 bloques.append(("item", item))
 
-            for i, (tipo, data) in enumerate(bloques):
+            gastado = 0
+            mostrados = 0
+            for tipo, data in bloques:
+                costo = self._costo_bloque(tipo, data)
+                if gastado + costo > presupuesto:
+                    break
+                gastado += costo
                 container.add_item(discord.ui.Separator())
                 if tipo == "header":
                     container.add_item(discord.ui.TextDisplay(f"**📂 {data}**"))
@@ -571,10 +598,12 @@ class TiendaLayoutView(discord.ui.LayoutView):
                         discord.ui.TextDisplay(texto),
                         accessory=boton)
                     container.add_item(section)
+                mostrados += 1
 
-        if total > len(items):
-            container.add_item(discord.ui.Separator())
-            container.add_item(discord.ui.TextDisplay(f"⚠️ Mostrando {len(items)} de {total} items we"))
+            if mostrados < total:
+                container.add_item(discord.ui.Separator())
+                container.add_item(discord.ui.TextDisplay(f"⚠️ Mostrando {mostrados} de {total} items we"))
+
         self.add_item(container)
 
 # ─────────────────────────────────────────
