@@ -497,18 +497,33 @@ class CategoriaSelect(discord.ui.Select):
         seleccion = self.values[0]
         categoria = None if seleccion == CATEGORIA_TODAS else seleccion
         items = get_tienda(self.guild_id, categoria)
-        nueva_vista = TiendaLayoutView(self.guild_id, items, categoria_actual=categoria)
+        # al cambiar de categoría siempre volvemos a la página 1
+        nueva_vista = TiendaLayoutView(self.guild_id, items, categoria_actual=categoria, pagina=0)
+        await interaction.response.edit_message(view=nueva_vista)
+
+class TiendaNavButton(discord.ui.Button):
+    """Botón de navegación (⏮ ◀ ▶ ⏭) para pasar de página en la tienda."""
+    def __init__(self, emoji: str, pagina_destino: int, guild_id: int, categoria_actual: str, disabled: bool):
+        super().__init__(style=discord.ButtonStyle.secondary, emoji=emoji, disabled=disabled)
+        self.pagina_destino = pagina_destino
+        self.guild_id = guild_id
+        self.categoria_actual = categoria_actual
+
+    async def callback(self, interaction: discord.Interaction):
+        items = get_tienda(self.guild_id, self.categoria_actual)
+        nueva_vista = TiendaLayoutView(self.guild_id, items, categoria_actual=self.categoria_actual, pagina=self.pagina_destino)
         await interaction.response.edit_message(view=nueva_vista)
 
 class TiendaLayoutView(discord.ui.LayoutView):
-    """Tienda armada con Components V2: selector de categoría arriba, y cada item como
-    una fila con miniatura + texto + botón de compra, todo en un único mensaje (sin embeds).
+    """Tienda armada con Components V2: selector de categoría arriba, cada item como
+    una fila con miniatura + texto + botón de compra, y navegación por páginas abajo,
+    todo en un único mensaje (sin embeds).
 
     Discord permite máximo 40 componentes en total por mensaje (contando todo lo anidado:
     separadores, secciones, texto, botones, etc). Cada item gasta una cantidad distinta de
-    componentes según tenga imagen o no, así que en vez de un límite fijo de "items" vamos
-    sumando el costo real y paramos justo antes de pasarnos, para nunca crashear sin
-    importar cuántos items tenga la tienda o cuántos tengan imagen."""
+    componentes según tenga imagen o no, así que en vez de cortar la lista y mostrar un
+    aviso, repartimos los items en páginas que sí caben dentro del límite y dejamos
+    botones para moverse entre ellas."""
 
     @staticmethod
     def _costo_bloque(tipo: str, data) -> int:
@@ -520,9 +535,34 @@ class TiendaLayoutView(discord.ui.LayoutView):
             return 6  # Separator(1) + Section(1) + TextDisplay(1) + Thumbnail(1) + ActionRow(1) + Button(1)
         return 4  # Separator(1) + Section(1) + TextDisplay(1) + Button-accessory(1)
 
-    def __init__(self, guild_id: int, items, categoria_actual: str = None):
+    @classmethod
+    def _construir_paginas(cls, bloques: list, presupuesto: int) -> list:
+        """Reparte los bloques (headers + items) en páginas que quepan dentro del
+        presupuesto de componentes disponible."""
+        paginas = []
+        pagina_actual = []
+        gastado = 0
+        for tipo, data in bloques:
+            costo = cls._costo_bloque(tipo, data)
+            if costo > presupuesto:
+                # bloque tan pesado que no cabe ni solo — lo mandamos a su propia
+                # página igual para no perderlo, en vez de crashear.
+                if pagina_actual:
+                    paginas.append(pagina_actual)
+                    pagina_actual, gastado = [], 0
+                paginas.append([(tipo, data)])
+                continue
+            if gastado + costo > presupuesto:
+                paginas.append(pagina_actual)
+                pagina_actual, gastado = [], 0
+            pagina_actual.append((tipo, data))
+            gastado += costo
+        if pagina_actual or not paginas:
+            paginas.append(pagina_actual)
+        return paginas
+
+    def __init__(self, guild_id: int, items, categoria_actual: str = None, pagina: int = 0):
         super().__init__(timeout=180)
-        total = len(items)
         categorias = get_categorias(guild_id)
         container = discord.ui.Container(accent_color=0x2ECC71)
         container.add_item(discord.ui.TextDisplay(
@@ -536,73 +576,78 @@ class TiendaLayoutView(discord.ui.LayoutView):
             fila_categoria.add_item(CategoriaSelect(guild_id, categorias, categoria_actual))
             container.add_item(fila_categoria)
             presupuesto -= 2  # ActionRow(1) + Select(1)
-        presupuesto -= 2  # reservado por si hace falta el aviso de "mostrando X de Y" al final
+        presupuesto -= 7  # reservado para la fila de navegación (separator+texto+actionrow+4 botones)
         presupuesto -= 2  # margen de seguridad extra, por si acaso
 
         if not items:
             container.add_item(discord.ui.Separator())
             container.add_item(discord.ui.TextDisplay("No hay items en esta categoría we."))
-        else:
-            # Arma una lista de "bloques" (encabezados de categoría + items) para poder
-            # meter un separador entre cada uno de forma consistente.
-            bloques = []
-            categoria_mostrada = None
-            for item in items:
-                categoria_item = item[-1]
-                if categoria_actual is None and categoria_item != categoria_mostrada:
-                    bloques.append(("header", categoria_item))
-                    categoria_mostrada = categoria_item
-                bloques.append(("item", item))
+            self.add_item(container)
+            return
 
-            gastado = 0
-            mostrados = 0
-            for tipo, data in bloques:
-                costo = self._costo_bloque(tipo, data)
-                if gastado + costo > presupuesto:
-                    break
-                gastado += costo
-                container.add_item(discord.ui.Separator())
-                if tipo == "header":
-                    container.add_item(discord.ui.TextDisplay(f"**📂 {data}**"))
-                    continue
-                _id, nombre, precio, descripcion, usable, imagen, rol_id, dinero_efecto, es_seguro, categoria = data
-                etiquetas = []
-                if usable:
-                    etiquetas.append("*Usable con `/useitem`*")
-                if rol_id:
-                    etiquetas.append("🎭 *Da un rol al usarlo*")
-                if dinero_efecto > 0:
-                    etiquetas.append(f"💰 *Da {dinero_efecto:,} al usarlo*")
-                elif dinero_efecto < 0:
-                    etiquetas.append(f"💸 *Cuesta {abs(dinero_efecto):,} extra al usarlo*")
-                if es_seguro:
-                    etiquetas.append("🛡️ *Protege contra `!robar`*")
-                etiqueta = ("\n" + "\n".join(etiquetas)) if etiquetas else ""
-                texto = f"**{nombre}**\n{descripcion or chr(0x200b)}{etiqueta}"
-                boton = ComprarButton(nombre, precio, guild_id)
-                # discord.ui.Section SIEMPRE necesita un accessory (Discord lo exige,
-                # no es opcional aunque el constructor lo permita) — por eso antes
-                # crasheaba la tienda entera cuando un item no tenía imagen. Si hay
-                # imagen usamos el Thumbnail como accessory y el botón va abajo en su
-                # propia fila; si no hay imagen, el botón mismo hace de accessory.
-                if imagen and imagen.strip().lower().startswith(("http://", "https://")):
-                    section = discord.ui.Section(
-                        discord.ui.TextDisplay(texto),
-                        accessory=discord.ui.Thumbnail(media=imagen.strip()))
-                    container.add_item(section)
-                    fila = discord.ui.ActionRow()
-                    fila.add_item(boton)
-                    container.add_item(fila)
-                else:
-                    section = discord.ui.Section(
-                        discord.ui.TextDisplay(texto),
-                        accessory=boton)
-                    container.add_item(section)
-                mostrados += 1
+        # Arma una lista de "bloques" (encabezados de categoría + items) para poder
+        # meter un separador entre cada uno de forma consistente.
+        bloques = []
+        categoria_mostrada = None
+        for item in items:
+            categoria_item = item[-1]
+            if categoria_actual is None and categoria_item != categoria_mostrada:
+                bloques.append(("header", categoria_item))
+                categoria_mostrada = categoria_item
+            bloques.append(("item", item))
 
-            if mostrados < total:
-                container.add_item(discord.ui.Separator())
-                container.add_item(discord.ui.TextDisplay(f"⚠️ Mostrando {mostrados} de {total} items we"))
+        paginas = self._construir_paginas(bloques, presupuesto)
+        total_paginas = len(paginas)
+        pagina = max(0, min(pagina, total_paginas - 1))
+
+        for tipo, data in paginas[pagina]:
+            container.add_item(discord.ui.Separator())
+            if tipo == "header":
+                container.add_item(discord.ui.TextDisplay(f"**📂 {data}**"))
+                continue
+            _id, nombre, precio, descripcion, usable, imagen, rol_id, dinero_efecto, es_seguro, categoria = data
+            etiquetas = []
+            if usable:
+                etiquetas.append("*Usable con `/useitem`*")
+            if rol_id:
+                etiquetas.append("🎭 *Da un rol al usarlo*")
+            if dinero_efecto > 0:
+                etiquetas.append(f"💰 *Da {dinero_efecto:,} al usarlo*")
+            elif dinero_efecto < 0:
+                etiquetas.append(f"💸 *Cuesta {abs(dinero_efecto):,} extra al usarlo*")
+            if es_seguro:
+                etiquetas.append("🛡️ *Protege contra `!robar`*")
+            etiqueta = ("\n" + "\n".join(etiquetas)) if etiquetas else ""
+            texto = f"**{nombre}**\n{descripcion or chr(0x200b)}{etiqueta}"
+            boton = ComprarButton(nombre, precio, guild_id)
+            # discord.ui.Section SIEMPRE necesita un accessory (Discord lo exige,
+            # no es opcional aunque el constructor lo permita) — por eso antes
+            # crasheaba la tienda entera cuando un item no tenía imagen. Si hay
+            # imagen usamos el Thumbnail como accessory y el botón va abajo en su
+            # propia fila; si no hay imagen, el botón mismo hace de accessory.
+            if imagen and imagen.strip().lower().startswith(("http://", "https://")):
+                section = discord.ui.Section(
+                    discord.ui.TextDisplay(texto),
+                    accessory=discord.ui.Thumbnail(media=imagen.strip()))
+                container.add_item(section)
+                fila = discord.ui.ActionRow()
+                fila.add_item(boton)
+                container.add_item(fila)
+            else:
+                section = discord.ui.Section(
+                    discord.ui.TextDisplay(texto),
+                    accessory=boton)
+                container.add_item(section)
+
+        if total_paginas > 1:
+            container.add_item(discord.ui.Separator())
+            container.add_item(discord.ui.TextDisplay(f"Página {pagina + 1} de {total_paginas}"))
+            fila_nav = discord.ui.ActionRow()
+            fila_nav.add_item(TiendaNavButton("⏮️", 0, guild_id, categoria_actual, disabled=(pagina == 0)))
+            fila_nav.add_item(TiendaNavButton("◀️", pagina - 1, guild_id, categoria_actual, disabled=(pagina == 0)))
+            fila_nav.add_item(TiendaNavButton("▶️", pagina + 1, guild_id, categoria_actual, disabled=(pagina >= total_paginas - 1)))
+            fila_nav.add_item(TiendaNavButton("⏭️", total_paginas - 1, guild_id, categoria_actual, disabled=(pagina >= total_paginas - 1)))
+            container.add_item(fila_nav)
 
         self.add_item(container)
 
