@@ -8,6 +8,8 @@ import asyncio
 import math
 import json
 import io
+import base64
+import httpx
 from datetime import timedelta, datetime, timezone
 from discord import app_commands
 from discord.ext import commands
@@ -21,9 +23,38 @@ log = logging.getLogger("Teto")
 
 TOKEN = os.getenv("TOKEN")
 TU_ID = 1180967503682355220
+IMGBB_API_KEY = os.getenv("IMGBB_API_KEY")
 
 if not TOKEN:
     raise RuntimeError("❌ Falta TOKEN")
+
+# ─────────────────────────────────────────
+# SUBIDA DE IMÁGENES (para que se puedan subir archivos en vez de solo pegar un URL)
+# ─────────────────────────────────────────
+async def subir_imagen(attachment: discord.Attachment) -> str:
+    """Sube un archivo adjunto de Discord a imgbb y devuelve el URL permanente.
+    Si falla (o no hay IMGBB_API_KEY configurada) devuelve "".
+    No usamos el .url del adjunto directamente porque los links de attachments de
+    Discord expiran (llevan parámetros ex/is/hm que vencen), así que guardarlos tal
+    cual en la base de datos los terminaría rompiendo."""
+    if not IMGBB_API_KEY:
+        log.warning("IMGBB_API_KEY no configurada — no se puede subir la imagen")
+        return ""
+    if not (attachment.content_type or "").startswith("image/"):
+        return ""
+    try:
+        data = await attachment.read()
+        async with httpx.AsyncClient(timeout=20) as client:
+            resp = await client.post(
+                "https://api.imgbb.com/1/upload",
+                data={"key": IMGBB_API_KEY, "image": base64.b64encode(data).decode()},
+            )
+        if resp.status_code == 200:
+            return resp.json()["data"]["url"]
+        log.warning(f"imgbb respondió {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        log.warning(f"Fallo subiendo imagen a imgbb: {e}")
+    return ""
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -521,16 +552,25 @@ class TiendaLayoutView(discord.ui.LayoutView):
                     etiquetas.append("🛡️ *Protege contra `!robar`*")
                 etiqueta = ("\n" + "\n".join(etiquetas)) if etiquetas else ""
                 texto = f"**{nombre}**\n{descripcion or chr(0x200b)}{etiqueta}"
+                boton = ComprarButton(nombre, precio, guild_id)
+                # discord.ui.Section SIEMPRE necesita un accessory (Discord lo exige,
+                # no es opcional aunque el constructor lo permita) — por eso antes
+                # crasheaba la tienda entera cuando un item no tenía imagen. Si hay
+                # imagen usamos el Thumbnail como accessory y el botón va abajo en su
+                # propia fila; si no hay imagen, el botón mismo hace de accessory.
                 if imagen and imagen.strip().lower().startswith(("http://", "https://")):
                     section = discord.ui.Section(
                         discord.ui.TextDisplay(texto),
                         accessory=discord.ui.Thumbnail(media=imagen.strip()))
+                    container.add_item(section)
+                    fila = discord.ui.ActionRow()
+                    fila.add_item(boton)
+                    container.add_item(fila)
                 else:
-                    section = discord.ui.Section(discord.ui.TextDisplay(texto))
-                container.add_item(section)
-                fila = discord.ui.ActionRow()
-                fila.add_item(ComprarButton(nombre, precio, guild_id))
-                container.add_item(fila)
+                    section = discord.ui.Section(
+                        discord.ui.TextDisplay(texto),
+                        accessory=boton)
+                    container.add_item(section)
 
         if total > len(items):
             container.add_item(discord.ui.Separator())
@@ -1283,19 +1323,29 @@ class ConfigCog(commands.Cog):
     @app_commands.command(name="additem", description="Agrega un item a la tienda")
     @app_commands.describe(nombre="Nombre del item", precio="Precio del item", descripcion="Descripción (opcional)",
                            categoria="Categoría del item (si no existe, se crea sola; por defecto 'General')",
-                           imagen="URL de una imagen para la miniatura del item (opcional)")
+                           imagen="URL de una imagen para la miniatura del item (opcional)",
+                           imagen_archivo="O sube directamente una imagen desde tus archivos (opcional)")
     @is_staff_tienda_app()
-    async def additem_slash(self, interaction: discord.Interaction, nombre: str, precio: int, descripcion: str = "", categoria: str = "General", imagen: str = ""):
+    async def additem_slash(self, interaction: discord.Interaction, nombre: str, precio: int, descripcion: str = "",
+                             categoria: str = "General", imagen: str = "", imagen_archivo: discord.Attachment = None):
         if precio <= 0:
             return await interaction.response.send_message("❌ El precio tiene que ser mayor a 0 we", ephemeral=True)
         existente = get_item_tienda(interaction.guild.id, nombre)
         if existente:
             return await interaction.response.send_message(f"❌ Ya existe un item llamado `{nombre}` we, usa `/delitem` primero si quieres reemplazarlo", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        if imagen_archivo:
+            url_subida = await subir_imagen(imagen_archivo)
+            if url_subida:
+                imagen = url_subida
+            else:
+                return await interaction.followup.send(
+                    "❌ No pude subir esa imagen (¿es un archivo de imagen válido? ¿está configurado `IMGBB_API_KEY`?) we", ephemeral=True)
         categoria = categoria.strip() or "General"
         cursor.execute("INSERT INTO tienda (guild_id, nombre, precio, descripcion, usable, mensaje_uso, imagen, categoria) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                        (interaction.guild.id, nombre, precio, descripcion, 0, "", imagen, categoria))
         db.commit()
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"✅ Agregado **{nombre}** a la tienda por **{format_dinero(interaction.guild.id, precio)}** en la categoría **{categoria}**\n"
             f"Usa `/edititem` con campo `usable`, `imagen`, `rol`, `dinero`, `seguro` o `categoria` para personalizarlo.")
 
@@ -1305,7 +1355,8 @@ class ConfigCog(commands.Cog):
 
     @app_commands.command(name="edititem", description="Edita un item de la tienda")
     @app_commands.describe(nombre="Item a editar", campo="Qué campo cambiar",
-                           valor="Nuevo valor (rol: menciona o pega el ID del rol · dinero: número, puede ser negativo · seguro: si/no)")
+                           valor="Nuevo valor (rol: menciona o pega el ID del rol · dinero: número, puede ser negativo · seguro: si/no). No hace falta si subes imagen_archivo",
+                           imagen_archivo="Para cambiar la imagen subiendo un archivo en vez de pegar un URL (ignora 'campo'/'valor')")
     @app_commands.choices(campo=[
         app_commands.Choice(name="nombre", value="nombre"),
         app_commands.Choice(name="precio", value="precio"),
@@ -1319,11 +1370,29 @@ class ConfigCog(commands.Cog):
         app_commands.Choice(name="seguro", value="seguro"),
     ])
     @is_staff_tienda_app()
-    async def edititem_slash(self, interaction: discord.Interaction, nombre: str, campo: app_commands.Choice[str], valor: str):
+    async def edititem_slash(self, interaction: discord.Interaction, nombre: str,
+                              campo: app_commands.Choice[str] = None, valor: str = "",
+                              imagen_archivo: discord.Attachment = None):
         item = get_item_tienda(interaction.guild.id, nombre)
         if not item:
             return await interaction.response.send_message(f"❌ No existe el item `{nombre}` we", ephemeral=True)
         _id = item[0]
+
+        # Si suben un archivo de imagen, eso manda por sobre campo/valor.
+        if imagen_archivo:
+            await interaction.response.defer(ephemeral=True)
+            url_subida = await subir_imagen(imagen_archivo)
+            if not url_subida:
+                return await interaction.followup.send(
+                    "❌ No pude subir esa imagen (¿es un archivo de imagen válido? ¿está configurado `IMGBB_API_KEY`?) we", ephemeral=True)
+            cursor.execute("UPDATE tienda SET imagen=%s WHERE id=%s", (url_subida, _id))
+            db.commit()
+            return await interaction.followup.send(f"✅ Imagen de **{nombre}** actualizada we")
+
+        if campo is None:
+            return await interaction.response.send_message(
+                "❌ Elige un `campo` para editar, o sube `imagen_archivo` directamente we", ephemeral=True)
+
         campo_val = campo.value
         if campo_val == "nombre":
             cursor.execute("UPDATE tienda SET nombre=%s WHERE id=%s", (valor, _id))
